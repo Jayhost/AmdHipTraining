@@ -1,8 +1,7 @@
-// train_gpt_oss_simple.cpp
-// Simplified GPT-OSS for testing: Tiny params, char tokenizer, reads input.txt directly.
-// Includes all features: Muon, BF16, MoE, GQA, RoPE, Sink Bias, Sliding Window.
-// Compile: hipcc -O3 train_gpt_oss_simple.cpp -o train_gpt_oss_simple
-// Run:     ./train_gpt_oss_simple
+// train_gpt_oss_hip.cpp
+// AMD HIP GPU implementation of GPT-OSS with Muon Optimizer (BF16 Mixed Precision)
+// Compile: hipcc -O3 train_gpt_oss_hip.cpp -o train_gpt_oss_hip
+// Run: ./train_gpt_oss_hip
 
 #include <hip/hip_runtime.h>
 #include <hip/amd_detail/amd_hip_bfloat16.h>
@@ -21,6 +20,7 @@
 
 using bf16 = hip_bfloat16;
 
+// Robust conversion helpers to avoid missing intrinsic errors across ROCm versions
 __device__ __host__ static inline float bf16_to_float(bf16 val) { return (float)val; }
 __device__ __host__ static inline bf16 float_to_bf16(float val) { return (bf16)val; }
 
@@ -32,6 +32,7 @@ __device__ __host__ static inline bf16 float_to_bf16(float val) { return (bf16)v
     } \
 } while(0)
 
+// VRAM Tracker to strictly enforce 8GB limit
 static size_t g_vram_used = 0;
 static const size_t VRAM_BUDGET = 8ull * 1024 * 1024 * 1024; // 8 GB
 #define TRACKED_MALLOC(ptr, bytes) do { \
@@ -45,24 +46,25 @@ static const size_t VRAM_BUDGET = 8ull * 1024 * 1024 * 1024; // 8 GB
 } while(0)
 
 // ============================================================
-// GPT-OSS Tiny Hyperparameters
+// GPT-OSS Hyperparameters (~410M Params for 8GB VRAM)
 // ============================================================
-const int B = 8;          // batch_size
-const int T = 32;         // max_seq_len
-const int MAX_ITERS = 2000;
-const int EVAL_INTERVAL = 100;
-const int EVAL_ITERS = 50;
+const int B = 4;          // batch_size
+const int T = 256;        // max_seq_len (we slice T=256 from 1024)
+const int MAX_ITERS = 50000;
+const int EVAL_INTERVAL = 500;
 const float LR = 1e-3f;   // AdamW LR for 1D params
-const int C = 128;        // d_model
-const int NH = 4;         // n_heads (Query heads)
+const int EVAL_ITERS = 200;
+const int V = 100277;     // cl100k_base vocab size
+const int C = 768;        // d_model
+const int NH = 12;        // n_heads (Query heads)
 const int NKV = 2;        // n_kv_heads (GQA)
 const int NGRP = NH / NKV;// n_kv_groups
-const int DK = C / NH;    // d_k = 32
-const int DFF = 32;       // intermediate_size AFTER SwiGLU
-const int L = 4;          // n_layers
+const int DK = C / NH;    // d_k = 64
+const int DFF = 1536;     // intermediate_size AFTER SwiGLU
+const int L = 15;         // n_layers
 const int E = 4;          // num_experts in MoE
 const int K = 2;          // experts_per_token (Top-K routing)
-const int SLIDING_WINDOW = 8;
+const int SLIDING_WINDOW = 128;
 const float ROPE_THETA = 10000.0f;
 const float ROPE_FACTOR = 4.0f;
 const float SINK_INIT = 4.0f;
@@ -70,33 +72,12 @@ const float SWIGLU_CLIP = 7.0f;
 const float AUX_COEF = 0.02f;
 const float RMS_EPS = 1e-6f;
 const int BLOCK_SIZE_KERNEL = 256;
-const char* CKPT_PATH = "gpt_oss_simple_checkpoint.bin";
+const char* CKPT_PATH = "gpt_oss_hip_checkpoint.bin";
 
 // Muon Optimizer Hyperparameters
-const float MUON_LR = 2e-3f;   
-const float MUON_BETA = 0.95f; 
-const int NS_ITERS = 5;        
-
-// ============================================================
-// Tokenizer
-// ============================================================
-struct CharTokenizer {
-    std::map<char, int> stoi;
-    std::map<int, char> itos;
-    int vocab_size = 0;
-    void init(const std::string& text) {
-        std::vector<char> unique_chars;
-        for (char ch : text) if (stoi.find(ch) == stoi.end()) {
-            stoi[ch] = (int)unique_chars.size(); itos[(int)unique_chars.size()] = ch; unique_chars.push_back(ch);
-        }
-        std::sort(unique_chars.begin(), unique_chars.end());
-        stoi.clear(); itos.clear();
-        for (int i = 0; i < (int)unique_chars.size(); i++) { stoi[unique_chars[i]] = i; itos[i] = unique_chars[i]; }
-        vocab_size = (int)unique_chars.size();
-    }
-    std::vector<int> encode(const std::string& s) { std::vector<int> r; for (char ch : s) r.push_back(stoi[ch]); return r; }
-    std::string decode(const std::vector<int>& ids) { std::string r; for (int id : ids) r += itos[id]; return r; }
-};
+const float MUON_LR = 2e-3f;   // Muon learning rate for 2D weights
+const float MUON_BETA = 0.95f; // Muon momentum
+const int NS_ITERS = 5;        // Newton-Schulz iterations
 
 // ============================================================
 // HIP Kernels - Forward Pass (BF16)
@@ -305,6 +286,7 @@ __global__ void residual_forward_f32_kernel(bf16* out, const bf16* inp1, const f
     out[idx] = float_to_bf16(bf16_to_float(inp1[idx]) + inp2[idx]);
 }
 
+// --- FUSED Softmax + Cross-Entropy Forward ---
 __global__ void crossentropy_forward_fused_kernel(float* losses, const bf16* logits, const int* targets, const float* loss_mask, int B, int T, int V) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= B * T) return;
     float mask = loss_mask[idx];
@@ -523,6 +505,7 @@ __global__ void residual_backward_kernel(float* dinp1, float* dinp2, const float
     int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= N) return; dinp1[idx] += dout[idx]; dinp2[idx] += dout[idx];
 }
 
+// --- FUSED Softmax + Cross-Entropy Backward ---
 __global__ void crossentropy_softmax_backward_fused_kernel(float* dlogits, const float* dlosses, const bf16* logits, const int* targets, const float* loss_mask, int B, int T, int V) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= B * T) return;
     float mask = loss_mask[idx];
@@ -613,6 +596,7 @@ struct GptOSS {
     float *d_dmoe_win, *d_dmoe_bin, *d_dmoe_wout, *d_dmoe_bout, *d_dmoe_rw, *d_dmoe_rb;
     float *d_drms2w, *d_drmsfw, *d_dlm_head, *d_m, *d_v_adam;
     
+    // Muon Workspaces
     float *d_muon_ws, *d_muon_ws2; 
     float *d_gram;                   
     float *d_norm_buf;               
@@ -657,13 +641,13 @@ size_t calc_num_params(int V) {
 
 size_t calc_num_1d_params() {
     size_t size1d = 0;
-    size1d += L * C; 
-    size1d += L * NH; 
-    size1d += L * E * 2 * DFF; 
-    size1d += L * E * C; 
-    size1d += L * E; 
-    size1d += L * C; 
-    size1d += C; 
+    size1d += L * C; // rms1w
+    size1d += L * NH; // sink_logits
+    size1d += L * E * 2 * DFF; // moe_bin
+    size1d += L * E * C; // moe_bout
+    size1d += L * E; // moe_rb
+    size1d += L * C; // rms2w
+    size1d += C; // rmsfw
     return size1d;
 }
 
@@ -766,6 +750,7 @@ void gpt_oss_free(GptOSS *model) {
 void gpt_oss_zero_grad(GptOSS *model) {
     auto grads = get_grad_list(model); for (auto& g : grads) HIP_CHECK(hipMemset(g.d_ptr, 0, g.size * sizeof(float)));
     #define HIP_MEMZERO_F32(ptr, size) HIP_CHECK(hipMemset(ptr, 0, size * sizeof(float)))
+    #define HIP_MEMZERO_BF16(ptr, size) HIP_CHECK(hipMemset(ptr, 0, size * sizeof(bf16)))
     int qkv_dim = (NH + 2 * NKV) * DK; int total_pairs = B * T * K;
     HIP_MEMZERO_F32(model->d_dencoded, B*T*C); HIP_MEMZERO_F32(model->d_drms1, L*B*T*C); HIP_MEMZERO_F32(model->d_dqkv, L*B*T*qkv_dim);
     HIP_MEMZERO_F32(model->d_datty, L*B*T*NH*DK); HIP_MEMZERO_F32(model->d_dattproj, L*B*T*C); HIP_MEMZERO_F32(model->d_dresidual2, L*B*T*C); HIP_MEMZERO_F32(model->d_drms2, L*B*T*C);
@@ -774,6 +759,7 @@ void gpt_oss_zero_grad(GptOSS *model) {
     HIP_MEMZERO_F32(model->d_drmsf, B*T*C); HIP_MEMZERO_F32(model->d_dsink, L*NH);
     HIP_MEMZERO_F32(model->d_dlogits, B*T*model->V);
     #undef HIP_MEMZERO_F32
+    #undef HIP_MEMZERO_BF16
 }
 
 void gpt_oss_save_checkpoint(GptOSS* model, int step, const char* filepath) {
@@ -954,30 +940,39 @@ void gpt_oss_update(GptOSS *model, float learning_rate, int step) {
     }
 }
 
-// ============================================================
-// Main
-// ============================================================
-int main() {
-    srand(42);
-    std::ifstream file("input.txt"); 
-    if (!file.is_open()) { fprintf(stderr, "Could not open input.txt!\n"); return 1; }
-    std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>()); 
-    file.close();
-    if (text.empty()) { fprintf(stderr, "input.txt is empty!\n"); return 1; }
+auto load_int_bin = [](const char* path, int py_T, int& num_seqs, std::vector<int>& data_vec) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.seekg(0, std::ios::end); size_t size = f.tellg(); f.seekg(0, std::ios::beg);
+    num_seqs = size / (py_T * sizeof(int)); data_vec.resize(num_seqs * py_T);
+    f.read(reinterpret_cast<char*>(data_vec.data()), size); return true;
+};
+auto load_float_bin = [](const char* path, int py_T, int& num_seqs, std::vector<float>& data_vec) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.seekg(0, std::ios::end); size_t size = f.tellg(); f.seekg(0, std::ios::beg);
+    num_seqs = size / (py_T * sizeof(float)); data_vec.resize(num_seqs * py_T);
+    f.read(reinterpret_cast<char*>(data_vec.data()), size); return true;
+};
 
-    CharTokenizer tokenizer; tokenizer.init(text); 
-    int V = tokenizer.vocab_size; 
-    printf("Vocab size: %d\n", V);
-    
-    std::vector<int> tokens = tokenizer.encode(text); 
-    int n = (int)(0.9 * tokens.size());
-    if (n < T + 2) { fprintf(stderr, "input.txt is too small for sequence length T=%d\n", T); return 1; }
-    std::vector<int> train_tokens(tokens.begin(), tokens.begin() + n), val_tokens(tokens.begin() + n, tokens.end());
+int main() {
+    int python_T = 1024, num_train_seqs = 0, num_val_seqs = 0;
+    std::vector<int> train_data, val_data; std::vector<float> train_mask, val_mask;
+    if (!load_int_bin("train.bin", python_T, num_train_seqs, train_data) || !load_float_bin("train_mask.bin", python_T, num_train_seqs, train_mask)) {
+        printf("Failed to load train data. Generating dummy train data...\n");
+        num_train_seqs = 1000; train_data.resize(num_train_seqs * python_T); train_mask.resize(num_train_seqs * python_T, 1.0f);
+        for (int i = 0; i < train_data.size(); i++) train_data[i] = rand() % V;
+    } else printf("Loaded %d train sequences.\n", num_train_seqs);
+    if (!load_int_bin("val.bin", python_T, num_val_seqs, val_data) || !load_float_bin("val_mask.bin", python_T, num_val_seqs, val_mask)) {
+        printf("Failed to load val data. Generating dummy val data...\n");
+        num_val_seqs = 200; val_data.resize(num_val_seqs * python_T); val_mask.resize(num_val_seqs * python_T, 1.0f);
+        for (int i = 0; i < val_data.size(); i++) val_data[i] = rand() % V;
+    } else printf("Loaded %d val sequences.\n", num_val_seqs);
 
     GptOSS model;
-    printf("Allocating model with ~%zuK parameters...\n", calc_num_params(V) / 1000);
+    printf("Allocating model with ~%zuM parameters...\n", calc_num_params(V) / 1000000);
     gpt_oss_alloc(&model, V);
-    printf("Model allocated. VRAM used: %.2f MB\n", (float)g_vram_used / 1e6);
+    printf("Model allocated. VRAM used: %.2f GB\n", (float)g_vram_used / 1e9);
 
     std::mt19937 rng(42); std::normal_distribution<float> dist(0.0f, 0.02f);
     auto init_tensor = [&](bf16* d_ptr, size_t size) {
@@ -998,77 +993,36 @@ int main() {
     }
 
     int start_step = gpt_oss_load_checkpoint(&model, CKPT_PATH);
-    std::vector<int> h_inputs(B * T), h_targets(B * T); 
-    std::vector<float> h_loss_mask(B * T, 1.0f), h_losses(B * T); 
-
-    auto eval_loss = [&](const std::vector<int>& data_tokens) -> float {
-        float total_loss = 0.0f; int count = 0; int data_len = (int)data_tokens.size();
-        if (data_len <= T + 1) return 0.0f;
-        for (int k = 0; k < EVAL_ITERS; k++) {
-            for (int b = 0; b < B; b++) {
-                int ix = rand() % (data_len - T - 1);
-                for (int t = 0; t < T; t++) {
-                    h_inputs[b * T + t] = data_tokens[ix + t];
-                    h_targets[b * T + t] = data_tokens[ix + t + 1];
-                }
-            }
-            gpt_oss_forward(&model, h_inputs.data(), h_targets.data(), h_loss_mask.data());
-            HIP_CHECK(hipMemcpy(h_losses.data(), model.d_losses, B * T * sizeof(float), hipMemcpyDeviceToHost));
-            for (int i = 0; i < B * T; i++) total_loss += h_losses[i]; 
-            count += B * T;
-        }
-        return total_loss / count;
-    };
+    std::vector<int> h_inputs(B * T); std::vector<int> h_targets(B * T); std::vector<float> h_loss_mask(B * T, 1.0f); 
 
     for (int step = start_step; step < MAX_ITERS; step++) {
-        if (step % EVAL_INTERVAL == 0) {
-            printf("Step %d: train loss %f, val loss %f\n", step, eval_loss(train_tokens), eval_loss(val_tokens));
-        }
         for (int b = 0; b < B; b++) {
-            int ix = rand() % (n - T - 1);
+            int seq_idx = rand() % num_train_seqs;
+            int start_t = rand() % (python_T - T - 1);
             for (int t = 0; t < T; t++) {
-                h_inputs[b * T + t] = train_tokens[ix + t];
-                h_targets[b * T + t] = train_tokens[ix + t + 1];
+                int curr_idx = seq_idx * python_T + start_t + t, next_idx = seq_idx * python_T + start_t + t + 1;
+                h_inputs[b * T + t] = train_data[curr_idx];
+                h_targets[b * T + t] = train_data[next_idx];
+                h_loss_mask[b * T + t] = train_mask[next_idx];
             }
         }
         gpt_oss_zero_grad(&model);
         gpt_oss_forward(&model, h_inputs.data(), h_targets.data(), h_loss_mask.data());
+        
+        if (step % 10 == 0) {
+            std::vector<float> losses(B * T);
+            HIP_CHECK(hipMemcpy(losses.data(), model.d_losses, B * T * sizeof(float), hipMemcpyDeviceToHost));
+            float avg_loss = 0.0f;
+            for (float l : losses) avg_loss += l;
+            avg_loss /= (B * T);
+            printf("Step %d | Loss: %.4f\n", step, avg_loss);
+        }
+        
         gpt_oss_backward(&model);
         gpt_oss_update(&model, LR, step + 1);
 
-        if (step % 10 == 0) {
-            float loss; HIP_CHECK(hipMemcpy(&loss, model.d_losses, sizeof(float), hipMemcpyDeviceToHost));
-            printf("Step %d | Loss: %.4f\n", step, loss);
-        }
-        if (step > 0 && step % (EVAL_INTERVAL * 2) == 0) gpt_oss_save_checkpoint(&model, step, CKPT_PATH);
+        if (step > 0 && step % EVAL_INTERVAL == 0) gpt_oss_save_checkpoint(&model, step, CKPT_PATH);
     }
-    gpt_oss_save_checkpoint(&model, MAX_ITERS, CKPT_PATH);
-
-    printf("Generating text...\n"); 
-    std::vector<int> gen_tokens(1, tokens[0]); 
-    std::vector<bf16> h_logits(V);
-    for (int i = 0; i < 300; i++) {
-        int start_idx = std::max(0, (int)gen_tokens.size() - T), context_len = std::min((int)gen_tokens.size(), T);
-        std::vector<int> h_gen_inputs(B * T, 0); 
-        for (int b = 0; b < B; b++) {
-            for (int t = 0; t < context_len; t++) h_gen_inputs[b * T + t] = gen_tokens[start_idx + t];
-        }
-        gpt_oss_forward(&model, h_gen_inputs.data(), NULL, NULL); 
-        HIP_CHECK(hipMemcpy(h_logits.data(), model.d_logits + (context_len - 1) * V, V * sizeof(bf16), hipMemcpyDeviceToHost));
-        
-        float max_val = -1e10f;
-        for (int j = 0; j < V; j++) { float v = h_logits[j]; if (v > max_val) max_val = v; }
-        std::vector<float> probs(V);
-        float sum_exp = 0;
-        for (int j = 0; j < V; j++) { probs[j] = expf((float)h_logits[j] - max_val); sum_exp += probs[j]; }
-        
-        float r = (float)rand() / RAND_MAX, cdf = 0.0f; int next_token = V - 1;
-        for (int j = 0; j < V; j++) { cdf += probs[j] / sum_exp; if (r < cdf) { next_token = j; break; } } 
-        gen_tokens.push_back(next_token);
-    }
-    std::string generated_text = tokenizer.decode(gen_tokens); 
-    printf("---\n%s\n---\n", generated_text.c_str());
-
     gpt_oss_free(&model);
     return 0;
 }
